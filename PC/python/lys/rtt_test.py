@@ -1,9 +1,67 @@
+import os
+import sys
+import argparse
 import threading
+import datetime
+import ast
+import signal
 import Queue
 import socket
 import select
+import msvcrt
 
-# TODO: Probably needs to be opened and closed if two debuggers are present.
+_run = True
+
+def sigint_handler(signal, frame):
+    global RTT_Listener
+    global _run
+
+    print "Caught SIGINT"
+    RTT_Listener.close()
+    _run = False
+    
+def queue_reader(queue):
+    global _run
+    
+    print "Started queue reader"
+    
+    while _run:
+        try:
+            event = queue.get(False, 1)
+            if event.data != None and len(event.data) > 0:
+                print event.data    
+        except Exception as e:
+            # print e
+            pass
+        
+    print "Stopped queue reader"
+    
+def queue_writer(queue):
+    global _run
+    
+    print "Started queue writer"
+    print "Press 1 to start audio. Press 0 to stop audio"
+    
+    while _run:
+        i = msvcrt.getch()
+        if i == "1":
+            print "Sending audio start command"
+            queue.put("1")
+        elif i == "0":
+            print "Sending audio stop command"
+            queue.put("0")
+        elif i == "q":
+            RTT_Listener.close()
+            _run = False
+            
+        elif i == "Q":
+            RTT_Listener.close()
+            _run = False
+            
+    print "Stopped queue writer"
+        
+    
+signal.signal(signal.SIGINT, sigint_handler)
 
 class RTTError(Exception):
     """Subclass for reporting errors."""
@@ -41,94 +99,6 @@ class RTTEvent(object):
     def is_type(self, event_type_str):
         """A convenience method for comparing types."""
         return (self.event_type == self.EVENT_TYPES_REVERSE[event_type_str])
-
-
-class RTT(object):
-    """A higher-level interface to an RTT socket. Provides a thread-friendly
-    interface for reading and writing to the socket.
-
-    """
-
-    def __init__(self, sn, debug_log=None):
-        """Constructs a new RTT object and starts an RTT thread."""
-        self.sn = sn
-
-        self._debugLog = debug_log
-        self.rxQueue = Queue.Queue()
-        self.txQueue = Queue.Queue()
-        self.snConfirmed = False
-        self.startupIdleCount = 0
-        self.closed = False
-
-        self._thread = RTTThread(self.rxQueue, self.txQueue)
-        self._thread.start()
-
-    def write(self, data_str):
-        """Adds the specified str to write queue."""
-        if (self.closed):
-            raise RTTError("Can not write to a closed terminal.")
-        if (self._debugLog):
-            self._debugLog.append('[RTT] Writing: ' + str([ord(x) for x in data_str]))
-        self.txQueue.put(data_str)
-
-    def close(self):
-        """Instructs the RTT thread to shutdown."""
-        self.closed = True
-        self._thread.close()
-
-    def read(self, block=True, timeout_s=None):
-        """Reads an item from the queue."""
-        event = self.rxQueue.get(block, timeout_s)
-        if (event.is_type('RTT_EVENT_RX')):
-            if (self.snConfirmed):
-                if (not event.data.startswith('Process: ')):
-                    return event
-                else:
-                    return RTTEvent('RTT_EVENT_STARTUP')
-            else:
-                sn = self._parse_sn(event.data)
-                if (sn is not None):
-                    if (sn == self.sn):
-                        self.snConfirmed = True
-                        return RTTEvent('RTT_EVENT_CONNECTED')
-                    else:
-                        self.close()
-                        event = RTTEvent('RTT_EVENT_ERROR')
-                        event.err_str = ("Incorrect serial number found: %d"%sn)
-                        return event
-                else:
-                    return RTTEvent('RTT_EVENT_STARTUP')
-        elif (event.is_type('RTT_EVENT_IDLE')):
-            if (self.snConfirmed):
-                return event
-            else:
-                self.close()
-                event = RTTEvent('RTT_EVENT_ERROR')
-                event.err_str = ("J-Link serial number could not be confirmed.")
-                return event
-        elif (event.is_type('RTT_EVENT_ERROR')):
-            self.close()
-            return event
-        else:
-            raise RTTError("Unknown RTTEvent type: %d" % event.event_type)
-        self.rxQueue.task_done()
-
-    def _parse_sn(self, r_str):
-        # NOTE: If this is the first time the socket has been read then it will
-        #       start by printing a few lines:
-        #         "SEGGER J-Link V5.02k - Real time terminal output\r\n"
-        #         "J-Link OB-SAM3U128-V2-NordicSemi compiled Mar 15 2016 " \
-        #                                        "18:03:17 V1.0, SN=XXXXXX\r\n"
-        #         "Process: python2.7.7\r\n"
-        for line in r_str.split("\r\n"):
-            if (line.startswith("J-Link ")):
-                i = line.find("SN=")
-                if (i >= 0):
-                    try:
-                        return int(line[i+3:].strip())
-                    except ValueError:
-                        pass
-
 
 class RTTThread(threading.Thread):
     """Creates a simple interface to the telnet socket that is created by
@@ -211,3 +181,35 @@ class RTTThread(threading.Thread):
     def close(self):
         """Sets the semaphore to instruct the thread to close."""
         self._stop.set()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Run RTT socket interaction test')
+    parser.add_argument('-s',
+        '--serial_number',
+        required=True,
+        dest='serial_number',
+        type=int,
+        help='the serial number of the J-Link debugger')
+
+    # args = parser.parse_args()
+    
+    rxQueue = Queue.Queue()
+    txQueue = Queue.Queue()
+    
+    # Start reader thread
+    t = threading.Thread(target=queue_reader, args=(rxQueue,))
+    t.start()
+    
+    # Start writer thread
+    t2 = threading.Thread(target=queue_writer, args=(txQueue,))
+    t2.start()
+
+    # Open RTT socket. Blocks until SIGINT is caught
+    print "Starting socket listen"
+    RTT_Listener = RTTThread(rxQueue, txQueue)
+    RTT_Listener.start()
+    
+    t.join()
+    t2.join()
+    RTT_Listener.join()
+	
